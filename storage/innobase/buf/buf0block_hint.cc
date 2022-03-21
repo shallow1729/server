@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2020, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2020, 2021, MariaDB Corporation.
+Copyright (c) 2020, 2022, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License, version 2.0, as published by the
@@ -47,13 +47,30 @@ void Block_hint::buffer_fix_block_if_still_valid()
   if (m_block)
   {
     auto &cell= buf_pool.page_hash.cell_get(m_page_id.fold());
-    transactional_shared_lock_guard<page_hash_latch> g
-      {buf_pool.page_hash.lock_get(cell)};
+    auto &latch= buf_pool.page_hash.lock_get(cell);
+#ifndef NO_ELISION
+    if (xbegin())
+    {
+      if (latch.is_locked())
+        xabort();
+      uint32_t state;
+      if (buf_pool.is_uncompressed(m_block) &&
+          m_page_id == m_block->page.id() &&
+          ((state= m_block->page.state()) >= buf_page_t::FREED))
+        m_block->page.set_state(state + 1);
+      else
+        clear();
+      xend();
+      return;
+    }
+#endif
+    latch.lock_shared();
     if (buf_pool.is_uncompressed(m_block) && m_page_id == m_block->page.id() &&
         m_block->page.frame && m_block->page.in_file())
       m_block->page.fix();
     else
       clear();
+    latch.unlock_shared();
   }
 }
 }  // namespace buf
