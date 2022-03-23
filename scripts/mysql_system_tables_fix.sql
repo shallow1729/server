@@ -31,6 +31,18 @@ set alter_algorithm=DEFAULT;
 
 set @have_innodb= (select count(engine) from information_schema.engines where engine='INNODB' and support != 'NO');
 
+drop procedure if exists tmp_create_mariadb_sys;
+DELIMITER //
+create procedure tmp_create_mariadb_sys()
+begin
+  declare continue handler for 1290 set @skip_grants=1;
+  set @skip_grants=0;
+  CREATE USER IF NOT EXISTS 'mariadb.sys'@'localhost';
+end //
+delimiter ;
+call tmp_create_mariadb_sys();
+drop procedure tmp_create_mariadb_sys;
+
 ALTER TABLE user add File_priv enum('N','Y') COLLATE utf8_general_ci DEFAULT 'N' NOT NULL;
 
 # Detect whether or not we had the Grant_priv column
