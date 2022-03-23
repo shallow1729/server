@@ -667,31 +667,28 @@ dict_sys_tables_rec_read(
 		rec, DICT_FLD__SYS_TABLES__DB_TRX_ID, &len);
 	ut_ad(len == 6 || len == UNIV_SQL_NULL);
 	trx_id_t id = len == 6 ? mach_read_from_6(field) : 0;
-	if (id) {
-		if (trx_sys.find(nullptr, id, false)) {
-			heap = mem_heap_create(1024);
-			dict_index_t* index = UT_LIST_GET_FIRST(
-				dict_sys.sys_tables->indexes);
-			rec_offs* offsets = rec_get_offsets(
-				rec, index, nullptr, true, ULINT_UNDEFINED,
-				&heap);
-			const rec_t* old_vers;
-			row_vers_build_for_semi_consistent_read(
-				nullptr, rec, mtr, index, &offsets, &heap,
-				heap, &old_vers, nullptr);
-			rec = old_vers;
-			if (!rec) {
-				mem_heap_free(heap);
-				return READ_NOT_FOUND;
-			}
-			field = rec_get_nth_field_old(
-				rec, DICT_FLD__SYS_TABLES__DB_TRX_ID, &len);
-			if (UNIV_UNLIKELY(len != 6)) {
-				mem_heap_free(heap);
-				return READ_ERROR;
-			}
-			id = mach_read_from_6(field);
+	if (id && trx_sys.find(nullptr, id, false)) {
+		heap = mem_heap_create(1024);
+		dict_index_t* index = UT_LIST_GET_FIRST(
+			dict_sys.sys_tables->indexes);
+		rec_offs* offsets = rec_get_offsets(
+			rec, index, nullptr, true, ULINT_UNDEFINED, &heap);
+		const rec_t* old_vers;
+		row_vers_build_for_semi_consistent_read(
+			nullptr, rec, mtr, index, &offsets, &heap,
+			heap, &old_vers, nullptr);
+		rec = old_vers;
+		if (!rec) {
+			mem_heap_free(heap);
+			return READ_NOT_FOUND;
 		}
+		field = rec_get_nth_field_old(
+			rec, DICT_FLD__SYS_TABLES__DB_TRX_ID, &len);
+		if (UNIV_UNLIKELY(len != 6)) {
+			mem_heap_free(heap);
+			return READ_ERROR;
+		}
+		id = mach_read_from_6(field);
 	}
 
 	if (rec_get_deleted_flag(rec, 0)) {
@@ -1076,9 +1073,7 @@ err_len:
 
 	const trx_id_t trx_id = mach_read_from_6(field);
 
-	if (!trx_id) {
-		ut_ad(!rec_get_deleted_flag(rec, 0));
-	} else if (mtr && trx_sys.find(nullptr, trx_id, false)) {
+	if (trx_id && mtr && trx_sys.find(nullptr, trx_id, false)) {
 		dict_index_t* index = UT_LIST_GET_FIRST(
 			dict_sys.sys_columns->indexes);
 		rec_offs* offsets = rec_get_offsets(
@@ -1095,6 +1090,7 @@ err_len:
 	}
 
 	if (rec_get_deleted_flag(rec, 0)) {
+		ut_ad(trx_id);
 		return dict_load_column_del;
 	}
 
@@ -1631,10 +1627,9 @@ err_len:
 			nullptr, rec, mtr, sys_field, &offsets, &heap,
 			heap, &old_vers, nullptr);
 		rec = old_vers;
-		if (!old_vers) {
+		if (!old_vers || rec_get_deleted_flag(rec, 0)) {
 			return dict_load_field_none;
 		}
-		ut_ad(!rec_get_deleted_flag(rec, 0));
 	}
 
 	if (rec_get_deleted_flag(rec, 0)) {
@@ -1842,10 +1837,9 @@ err_len:
 			nullptr, rec, mtr, sys_index, &offsets, &heap,
 			heap, &old_vers, nullptr);
 		rec = old_vers;
-		if (!old_vers) {
+		if (!old_vers || rec_get_deleted_flag(rec, 0)) {
 			return dict_load_index_none;
 		}
-		ut_ad(!rec_get_deleted_flag(rec, 0));
 	}
 
 	field = rec_get_nth_field_old(
@@ -2471,9 +2465,8 @@ corrupted:
 	if (!table->is_readable()) {
 		/* Don't attempt to load the indexes from disk. */
 	} else if (err == DB_SUCCESS) {
-		err = dict_load_foreigns(table->name.m_name, NULL,
-					 true, true,
-					 ignore_err, fk_tables);
+		err = dict_load_foreigns(table->name.m_name, nullptr,
+					 0, true, ignore_err, fk_tables);
 
 		if (err != DB_SUCCESS) {
 			ib::warn() << "Load table " << table->name
@@ -2652,11 +2645,7 @@ Members that will be created and set by this function:
 foreign->foreign_col_names[i]
 foreign->referenced_col_names[i]
 (for i=0..foreign->n_fields-1) */
-static
-void
-dict_load_foreign_cols(
-/*===================*/
-	dict_foreign_t*	foreign)/*!< in/out: foreign constraint object */
+static void dict_load_foreign_cols(dict_foreign_t *foreign, trx_id_t trx_id)
 {
 	btr_pcur_t	pcur;
 	dtuple_t*	tuple;
@@ -2691,14 +2680,45 @@ dict_load_foreign_cols(
 	dfield_set_data(dfield, foreign->id, id_len);
 	dict_index_copy_types(tuple, sys_index, 1);
 
+	mem_heap_t* heap = nullptr;
 	btr_pcur_open_on_user_rec(sys_index, tuple, PAGE_CUR_GE,
 				  BTR_SEARCH_LEAF, &pcur, &mtr);
 	for (i = 0; i < foreign->n_fields; i++) {
+retry:
+		ut_a(btr_pcur_is_on_user_rec(&pcur));
 
 		rec = btr_pcur_get_rec(&pcur);
 
-		ut_a(btr_pcur_is_on_user_rec(&pcur));
-		ut_a(!rec_get_deleted_flag(rec, 0));
+		field = rec_get_nth_field_old(
+			rec, DICT_FLD__SYS_FOREIGN_COLS__DB_TRX_ID, &len);
+		ut_a(len == DATA_TRX_ID_LEN);
+
+		if (UNIV_LIKELY_NULL(heap)) {
+			mem_heap_empty(heap);
+		}
+
+		const trx_id_t id = mach_read_from_6(field);
+		if (!id) {
+		} else if (id != trx_id && trx_sys.find(nullptr, id, false)) {
+			rec_offs* offsets = rec_get_offsets(
+				rec, sys_index, nullptr, true, ULINT_UNDEFINED,
+				&heap);
+			const rec_t* old_vers;
+			row_vers_build_for_semi_consistent_read(
+				nullptr, rec, &mtr, sys_index, &offsets, &heap,
+				heap, &old_vers, nullptr);
+			rec = old_vers;
+			if (!rec || rec_get_deleted_flag(rec, 0)) {
+				goto next;
+			}
+		}
+
+		if (rec_get_deleted_flag(rec, 0)) {
+			ut_ad(id);
+next:
+			btr_pcur_move_to_next_user_rec(&pcur, &mtr);
+			goto retry;
+		}
 
 		field = rec_get_nth_field_old(
 			rec, DICT_FLD__SYS_FOREIGN_COLS__ID, &len);
@@ -2759,23 +2779,27 @@ dict_load_foreign_cols(
 	}
 
 	btr_pcur_close(&pcur);
-	mtr_commit(&mtr);
+	mtr.commit();
+	if (UNIV_LIKELY_NULL(heap)) {
+		mem_heap_free(heap);
+	}
 }
 
 /***********************************************************************//**
 Loads a foreign key constraint to the dictionary cache. If the referenced
 table is not yet loaded, it is added in the output parameter (fk_tables).
 @return DB_SUCCESS or error code */
-static MY_ATTRIBUTE((nonnull(1), warn_unused_result))
+static MY_ATTRIBUTE((warn_unused_result))
 dberr_t
 dict_load_foreign(
 /*==============*/
-	const char*		id,
-				/*!< in: foreign constraint id, must be
-				'\0'-terminated */
+	span<const char>	id,
+				/*!< in: foreign constraint id */
 	const char**		col_names,
 				/*!< in: column names, or NULL
 				to use foreign->foreign_table->col_names */
+	trx_id_t		trx_id,
+				/*!< in: current transaction id, or 0 */
 	bool			check_recursive,
 				/*!< in: whether to record the foreign table
 				parent count to avoid unlimited recursive
@@ -2795,80 +2819,79 @@ dict_load_foreign(
 {
 	dict_foreign_t*	foreign;
 	btr_pcur_t	pcur;
-	dtuple_t*	tuple;
-	mem_heap_t*	heap2;
-	dfield_t*	dfield;
-	const rec_t*	rec;
 	const byte*	field;
 	ulint		len;
 	mtr_t		mtr;
 	dict_table_t*	for_table;
 	dict_table_t*	ref_table;
-	size_t		id_len;
+        byte		dtuple_buf[DTUPLE_EST_ALLOC(1)];
 
 	DBUG_ENTER("dict_load_foreign");
 	DBUG_PRINT("dict_load_foreign",
-		   ("id: '%s', check_recursive: %d", id, check_recursive));
+		   ("id: '%.*s', check_recursive: %d",
+		    int(id.size()), id.data(), check_recursive));
 
 	ut_ad(dict_sys.locked());
-
-	id_len = strlen(id);
-
-	heap2 = mem_heap_create(1000);
-
-	mtr_start(&mtr);
 
 	dict_index_t* sys_index = dict_sys.sys_foreign->indexes.start;
 	ut_ad(!dict_sys.sys_foreign->not_redundant());
 
-	tuple = dtuple_create(heap2, 1);
-	dfield = dtuple_get_nth_field(tuple, 0);
-
-	dfield_set_data(dfield, id, id_len);
+	dtuple_t* tuple = dtuple_create_from_mem(dtuple_buf, sizeof dtuple_buf,
+                                                 1, 0);
+	dfield_set_data(dtuple_get_nth_field(tuple, 0), id.data(), id.size());
 	dict_index_copy_types(tuple, sys_index, 1);
+
+	mtr.start();
 
 	btr_pcur_open_on_user_rec(sys_index, tuple, PAGE_CUR_GE,
 				  BTR_SEARCH_LEAF, &pcur, &mtr);
-	rec = btr_pcur_get_rec(&pcur);
+	const rec_t* rec = btr_pcur_get_rec(&pcur);
+	mem_heap_t* heap = nullptr;
 
-	if (!btr_pcur_is_on_user_rec(&pcur)
-	    || rec_get_deleted_flag(rec, 0)) {
-		/* Not found */
-
-		ib::error() << "Cannot load foreign constraint " << id
-			<< ": could not find the relevant record in "
-			"SYS_FOREIGN";
-
+	if (!btr_pcur_is_on_user_rec(&pcur)) {
+	not_found:
 		btr_pcur_close(&pcur);
-		mtr_commit(&mtr);
-		mem_heap_free(heap2);
-
-		DBUG_RETURN(DB_ERROR);
+		mtr.commit();
+		if (UNIV_LIKELY_NULL(heap)) {
+			mem_heap_free(heap);
+		}
+		DBUG_RETURN(DB_NOT_FOUND);
 	}
 
+	static_assert(DICT_FLD__SYS_FOREIGN__ID == 0, "compatibility");
 	field = rec_get_nth_field_old(rec, DICT_FLD__SYS_FOREIGN__ID, &len);
 
 	/* Check if the id in record is the searched one */
-	if (len != id_len || memcmp(id, field, len)) {
-		{
-			ib::error	err;
-			err << "Cannot load foreign constraint " << id
-				<< ": found ";
-			err.write(field, len);
-			err << " instead in SYS_FOREIGN";
+	if (len != id.size() || memcmp(id.data(), field, id.size())) {
+		goto not_found;
+	}
+
+	field = rec_get_nth_field_old(
+		rec, DICT_FLD__SYS_FOREIGN__DB_TRX_ID, &len);
+	ut_a(len == DATA_TRX_ID_LEN);
+
+	const trx_id_t tid = mach_read_from_6(field);
+
+	if (tid && tid != trx_id && trx_sys.find(nullptr, tid, false)) {
+		rec_offs* offsets = rec_get_offsets(
+			rec, sys_index, nullptr, true, ULINT_UNDEFINED, &heap);
+		const rec_t* old_vers;
+		row_vers_build_for_semi_consistent_read(
+			nullptr, rec, &mtr, sys_index, &offsets, &heap,
+			heap, &old_vers, nullptr);
+		rec = old_vers;
+		if (!rec) {
+			goto not_found;
 		}
+	}
 
-		btr_pcur_close(&pcur);
-		mtr_commit(&mtr);
-		mem_heap_free(heap2);
-
-		DBUG_RETURN(DB_ERROR);
+	if (rec_get_deleted_flag(rec, 0)) {
+		ut_ad(tid);
+		goto not_found;
 	}
 
 	/* Read the table names and the number of columns associated
 	with the constraint */
-
-	mem_heap_free(heap2);
 
 	foreign = dict_mem_foreign_create();
 
@@ -2883,7 +2906,7 @@ dict_load_foreign(
 	foreign->type = (n_fields_and_type >> 24) & ((1U << 6) - 1);
 	foreign->n_fields = n_fields_and_type & dict_index_t::MAX_N_FIELDS;
 
-	foreign->id = mem_heap_strdupl(foreign->heap, id, id_len);
+	foreign->id = mem_heap_strdupl(foreign->heap, id.data(), id.size());
 
 	field = rec_get_nth_field_old(
 		rec, DICT_FLD__SYS_FOREIGN__FOR_NAME, &len);
@@ -2901,9 +2924,12 @@ dict_load_foreign(
 	dict_mem_referenced_table_name_lookup_set(foreign, TRUE);
 
 	btr_pcur_close(&pcur);
-	mtr_commit(&mtr);
+	mtr.commit();
+	if (UNIV_LIKELY_NULL(heap)) {
+		mem_heap_free(heap);
+	}
 
-	dict_load_foreign_cols(foreign);
+	dict_load_foreign_cols(foreign, trx_id);
 
 	ref_table = dict_sys.find_table(
 		{foreign->referenced_table_name_lookup,
@@ -2958,7 +2984,8 @@ dict_load_foreigns(
 	const char*		table_name,	/*!< in: table name */
 	const char**		col_names,	/*!< in: column names, or NULL
 						to use table->col_names */
-	bool			check_recursive,/*!< in: Whether to check
+	trx_id_t		trx_id,		/*!< in: DDL transaction id,
+						or 0 to check
 						recursive load of tables
 						chained by FK */
 	bool			check_charsets,	/*!< in: whether to check
@@ -2975,10 +3002,6 @@ dict_load_foreigns(
 	btr_pcur_t	pcur;
 	dtuple_t*	tuple;
 	dfield_t*	dfield;
-	const rec_t*	rec;
-	const byte*	field;
-	ulint		len;
-	dberr_t		err;
 	mtr_t		mtr;
 
 	DBUG_ENTER("dict_load_foreigns");
@@ -2995,12 +3018,14 @@ dict_load_foreigns(
 	}
 
 	ut_ad(!dict_sys.sys_foreign->not_redundant());
-	mtr_start(&mtr);
 
 	dict_index_t *sec_index = dict_table_get_next_index(
 		dict_table_get_first_index(dict_sys.sys_foreign));
 	ut_ad(!strcmp(sec_index->fields[0].name, "FOR_NAME"));
+	bool check_recursive = !trx_id;
+
 start_load:
+	mtr.start();
 
 	tuple = dtuple_create_from_mem(tuple_buf, sizeof(tuple_buf), 1, 0);
 	dfield = dtuple_get_nth_field(tuple, 0);
@@ -3011,7 +3036,9 @@ start_load:
 	btr_pcur_open_on_user_rec(sec_index, tuple, PAGE_CUR_GE,
 				  BTR_SEARCH_LEAF, &pcur, &mtr);
 loop:
-	rec = btr_pcur_get_rec(&pcur);
+	const rec_t* rec = btr_pcur_get_rec(&pcur);
+	const byte* field;
+	const auto maybe_deleted = rec_get_deleted_flag(rec, 0);
 
 	if (!btr_pcur_is_on_user_rec(&pcur)) {
 		/* End of index */
@@ -3022,6 +3049,7 @@ loop:
 	/* Now we have the record in the secondary index containing a table
 	name and a foreign constraint ID */
 
+	ulint len;
 	field = rec_get_nth_field_old(
 		rec, DICT_FLD__SYS_FOREIGN_FOR_NAME__NAME, &len);
 
@@ -3046,10 +3074,6 @@ loop:
 	may not be the same case, but the previous comparison showed that they
 	match with no-case.  */
 
-	if (rec_get_deleted_flag(rec, 0)) {
-		goto next_rec;
-	}
-
 	if (lower_case_table_names != 2 && memcmp(field, table_name, len)) {
 		goto next_rec;
 	}
@@ -3064,26 +3088,33 @@ loop:
 
 	ut_a(len <= MAX_TABLE_NAME_LEN);
 	memcpy(fk_id, field, len);
-	fk_id[len] = '\0';
 
 	btr_pcur_store_position(&pcur, &mtr);
 
-	mtr_commit(&mtr);
+	mtr.commit();
 
 	/* Load the foreign constraint definition to the dictionary cache */
 
-	err = dict_load_foreign(fk_id, col_names,
-				check_recursive, check_charsets, ignore_err,
-				fk_tables);
-
-	if (err != DB_SUCCESS) {
+	switch (dberr_t err
+		= dict_load_foreign({fk_id, len}, col_names, trx_id,
+				    check_recursive, check_charsets,
+				    ignore_err, fk_tables)) {
+	case DB_SUCCESS:
+		break;
+	case DB_NOT_FOUND:
+		if (maybe_deleted) {
+			break;
+		}
+		sql_print_error("InnoDB: Cannot load foreign constraint %.*s:"
+				" could not find the relevant record in "
+				"SYS_FOREIGN", int(len), fk_id);
+		/* fall through */
+	default:
 		btr_pcur_close(&pcur);
-
 		DBUG_RETURN(err);
 	}
 
-	mtr_start(&mtr);
-
+	mtr.start();
 	pcur.restore_position(BTR_SEARCH_LEAF, &mtr);
 next_rec:
 	btr_pcur_move_to_next_user_rec(&pcur, &mtr);
@@ -3096,15 +3127,11 @@ load_next_index:
 
 	sec_index = dict_table_get_next_index(sec_index);
 
-	if (sec_index != NULL) {
-
-		mtr_start(&mtr);
-
+	if (sec_index) {
 		/* Switch to scan index on REF_NAME, fk_max_recusive_level
 		already been updated when scanning FOR_NAME index, no need to
 		update again */
-		check_recursive = FALSE;
-
+		check_recursive = false;
 		goto start_load;
 	}
 

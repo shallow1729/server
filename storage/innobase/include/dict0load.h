@@ -89,7 +89,8 @@ dict_load_foreigns(
 	const char*		table_name,	/*!< in: table name */
 	const char**		col_names,	/*!< in: column names, or NULL
 						to use table->col_names */
-	bool			check_recursive,/*!< in: Whether to check
+	trx_id_t		trx_id,		/*!< in: DDL transaction id,
+						or 0 to check
 						recursive load of tables
 						chained by FK */
 	bool			check_charsets,	/*!< in: whether to check
