@@ -179,7 +179,7 @@ dict_getnext_system_low(
 {
 	rec_t*	rec = NULL;
 
-	while (!rec || rec_get_deleted_flag(rec, 0)) {
+	while (!rec) {
 		btr_pcur_move_to_next_user_rec(pcur, mtr);
 
 		rec = btr_pcur_get_rec(pcur);
@@ -209,9 +209,13 @@ dict_startscan_system(
 	mtr_t*		mtr,		/*!< in: the mini-transaction */
 	dict_table_t*	table)		/*!< in: system table */
 {
-	btr_pcur_open_at_index_side(true, table->indexes.start,
-				    BTR_SEARCH_LEAF, pcur, true, 0, mtr);
-	return dict_getnext_system_low(pcur, mtr);
+  btr_pcur_open_at_index_side(true, table->indexes.start, BTR_SEARCH_LEAF,
+                              pcur, true, 0, mtr);
+  const rec_t *rec;
+  do
+    rec= dict_getnext_system_low(pcur, mtr);
+  while (rec && rec_get_deleted_flag(rec, 0));
+  return rec;
 }
 
 /********************************************************************//**
@@ -230,7 +234,9 @@ dict_getnext_system(
 	pcur->restore_position(BTR_SEARCH_LEAF, mtr);
 
 	/* Get the next record */
-	rec = dict_getnext_system_low(pcur, mtr);
+	do {
+		rec = dict_getnext_system_low(pcur, mtr);
+	} while (rec && rec_get_deleted_flag(rec, 0));
 
 	return(rec);
 }
@@ -636,6 +642,8 @@ enum table_read_status { READ_OK= 0, READ_ERROR, READ_NOT_FOUND };
 @param[out]	n_cols		Pointer to number of columns for this table.
 @param[out]	flags		Pointer to table flags
 @param[out]	flags2		Pointer to table flags2
+@param[out]	trx_id		DB_TRX_ID of the committed SYS_TABLES record,
+				or nullptr to perform READ UNCOMMITTED
 @return whether the record was read correctly */
 MY_ATTRIBUTE((warn_unused_result))
 static
@@ -647,7 +655,8 @@ dict_sys_tables_rec_read(
 	ulint*			space_id,
 	ulint*			n_cols,
 	ulint*			flags,
-	ulint*			flags2)
+	ulint*			flags2,
+	trx_id_t*		trx_id)
 {
 	const byte*	field;
 	ulint		len;
@@ -657,8 +666,8 @@ dict_sys_tables_rec_read(
 	field = rec_get_nth_field_old(
 		rec, DICT_FLD__SYS_TABLES__DB_TRX_ID, &len);
 	ut_ad(len == 6 || len == UNIV_SQL_NULL);
-	if (len == UNIV_SQL_NULL) {
-	} else if (const trx_id_t id = mach_read_from_6(field)) {
+	trx_id_t id = len == 6 ? mach_read_from_6(field) : 0;
+	if (id) {
 		if (trx_sys.find(nullptr, id, false)) {
 			heap = mem_heap_create(1024);
 			dict_index_t* index = UT_LIST_GET_FIRST(
@@ -670,20 +679,30 @@ dict_sys_tables_rec_read(
 			row_vers_build_for_semi_consistent_read(
 				nullptr, rec, mtr, index, &offsets, &heap,
 				heap, &old_vers, nullptr);
-			if (!old_vers) {
+			rec = old_vers;
+			if (!rec) {
 				mem_heap_free(heap);
 				return READ_NOT_FOUND;
 			}
-			rec = old_vers;
-		} else {
-			goto check_delete_mark;
+			field = rec_get_nth_field_old(
+				rec, DICT_FLD__SYS_TABLES__DB_TRX_ID, &len);
+			if (UNIV_UNLIKELY(len != 6)) {
+				mem_heap_free(heap);
+				return READ_ERROR;
+			}
+			id = mach_read_from_6(field);
 		}
-	} else {
-check_delete_mark:
-		if (rec_get_deleted_flag(rec, 0)) {
-			ut_ad(id);
+	}
+
+	if (rec_get_deleted_flag(rec, 0)) {
+		ut_ad(id);
+		if (trx_id) {
 			return READ_NOT_FOUND;
 		}
+	}
+
+	if (trx_id) {
+		*trx_id = id;
 	}
 
 	field = rec_get_nth_field_old(
@@ -886,7 +905,7 @@ static ulint dict_check_sys_tables()
 			   ("name: %*.s", static_cast<int>(len), field));
 
 		if (dict_sys_tables_rec_read(rec, &mtr, &table_id, &space_id,
-					     &n_cols, &flags, &flags2)
+					     &n_cols, &flags, &flags2, nullptr)
 		    != READ_OK
 		    || space_id == TRX_SYS_SPACE) {
 			continue;
@@ -917,10 +936,13 @@ static ulint dict_check_sys_tables()
 		char*	filepath = fil_make_filepath(nullptr, name,
 						     IBD, false);
 
+		const bool not_dropped{!rec_get_deleted_flag(rec, 0)};
+
 		/* Check that the .ibd file exists. */
-		if (fil_ibd_open(false, FIL_TYPE_TABLESPACE,
+		if (fil_ibd_open(not_dropped, FIL_TYPE_TABLESPACE,
 				 space_id, dict_tf_to_fsp_flags(flags),
 				 name, filepath)) {
+		} else if (!not_dropped) {
 		} else if (srv_operation == SRV_OPERATION_NORMAL
 			   && srv_start_after_restore
 			   && srv_force_recovery < SRV_FORCE_NO_BACKGROUND
@@ -2137,6 +2159,7 @@ const char *dict_load_table_low(mtr_t *mtr,
 	ulint		t_num;
 	ulint		flags;
 	ulint		flags2;
+	trx_id_t	trx_id;
 	ulint		n_v_col;
 
 	if (const char* error_text = dict_sys_tables_rec_check(rec)) {
@@ -2145,7 +2168,8 @@ const char *dict_load_table_low(mtr_t *mtr,
 	}
 
 	if (auto r = dict_sys_tables_rec_read(rec, mtr, &table_id, &space_id,
-					      &t_num, &flags, &flags2)) {
+					      &t_num, &flags, &flags2,
+					      &trx_id)) {
 		*table = NULL;
 		return r == READ_ERROR ? dict_load_table_flags : nullptr;
 	}
@@ -2159,13 +2183,7 @@ const char *dict_load_table_low(mtr_t *mtr,
 	(*table)->space_id = space_id;
 	(*table)->id = table_id;
 	(*table)->file_unreadable = !!(flags2 & DICT_TF2_DISCARDED);
-
-	ulint len;
-	(*table)->def_trx_id = mach_read_from_6(
-		rec_get_nth_field_old(rec, DICT_FLD__SYS_TABLES__DB_TRX_ID,
-				      &len));
-	ut_ad(len == DATA_TRX_ID_LEN);
-	static_assert(DATA_TRX_ID_LEN == 6, "compatibility");
+	(*table)->def_trx_id = trx_id;
 	return(NULL);
 }
 
@@ -2251,7 +2269,7 @@ dict_load_tablespace(
 	}
 
 	table->space = fil_ibd_open(
-		true, FIL_TYPE_TABLESPACE, table->space_id,
+		2, FIL_TYPE_TABLESPACE, table->space_id,
 		dict_tf_to_fsp_flags(table->flags),
 		{table->name.m_name, strlen(table->name.m_name)}, filepath);
 
