@@ -72,13 +72,14 @@ static
 const char*
 dict_load_index_low(
 	byte*		table_id,	/*!< in/out: table id (8 bytes),
-					an "in" value if allocate=TRUE
-					and "out" when allocate=FALSE */
+					an "in" value if mtr
+					and "out" when !mtr */
 	mem_heap_t*	heap,		/*!< in/out: temporary memory heap */
 	const rec_t*	rec,		/*!< in: SYS_INDEXES record */
 	mtr_t*		mtr,		/*!< in/out: mini-transaction,
 					or nullptr if a pre-allocated
 					*index is to be filled in */
+	dict_table_t*	table,		/*!< in/out: table, or NULL */
 	dict_index_t**	index);		/*!< out,own: index, or NULL */
 
 /** Load a table column definition from a SYS_COLUMNS record to dict_table_t.
@@ -255,14 +256,13 @@ dict_process_sys_indexes_rec(
 	table_id_t*	table_id)	/*!< out: index table id */
 {
 	const char*	err_msg;
-	byte*		buf;
+	byte		buf[8];
 
 	ut_d(index->is_dummy = true);
 	ut_d(index->in_instant_init = false);
-	buf = static_cast<byte*>(mem_heap_alloc(heap, 8));
 
 	/* Parse the record, and get "dict_index_t" struct filled */
-	err_msg = dict_load_index_low(buf, heap, rec, nullptr, &index);
+	err_msg = dict_load_index_low(buf, heap, rec, nullptr, nullptr, &index);
 
 	*table_id = mach_read_from_8(buf);
 
@@ -1743,19 +1743,18 @@ static
 const char*
 dict_load_index_low(
 	byte*		table_id,	/*!< in/out: table id (8 bytes),
-					an "in" value if allocate=TRUE
-					and "out" when allocate=FALSE */
+					an "in" value if mtr
+					and "out" when !mtr */
 	mem_heap_t*	heap,		/*!< in/out: temporary memory heap */
 	const rec_t*	rec,		/*!< in: SYS_INDEXES record */
 	mtr_t*		mtr,		/*!< in/out: mini-transaction,
 					or nullptr if a pre-allocated
 					*index is to be filled in */
+	dict_table_t*	table,		/*!< in/out: table, or NULL */
 	dict_index_t**	index)		/*!< out,own: index, or NULL */
 {
 	const byte*	field;
 	ulint		len;
-	ulint		name_len;
-	char*		name_buf;
 	index_id_t	id;
 	ulint		n_fields;
 	ulint		type;
@@ -1827,7 +1826,8 @@ err_len:
 	const trx_id_t trx_id = mach_read_from_6(field);
 	if (!trx_id) {
 		ut_ad(!rec_get_deleted_flag(rec, 0));
-	} else if (mtr && trx_sys.find(nullptr, trx_id, false)) {
+	} else if (!mtr) {
+	} else if (trx_sys.find(nullptr, trx_id, false)) {
 		dict_index_t* sys_index = UT_LIST_GET_FIRST(
 			dict_sys.sys_indexes->indexes);
 		rec_offs* offsets = rec_get_offsets(
@@ -1840,17 +1840,12 @@ err_len:
 		if (!old_vers || rec_get_deleted_flag(rec, 0)) {
 			return dict_load_index_none;
 		}
+	} else if (rec_get_deleted_flag(rec, 0)
+		   && rec[8 + 8 + DATA_TRX_ID_LEN + DATA_ROLL_PTR_LEN]
+		   != static_cast<byte>(*TEMP_INDEX_PREFIX_STR)
+		   && table->def_trx_id < trx_id) {
+		table->def_trx_id = trx_id;
 	}
-
-	field = rec_get_nth_field_old(
-		rec, DICT_FLD__SYS_INDEXES__NAME, &name_len);
-	if (name_len == 0 || name_len == UNIV_SQL_NULL) {
-		goto err_len;
-	}
-	ut_ad(field == &rec[8 + 8 + DATA_TRX_ID_LEN + DATA_ROLL_PTR_LEN]);
-
-	name_buf = mem_heap_strdupl(heap, (const char*) field,
-				    name_len);
 
 	field = rec_get_nth_field_old(
 		rec, DICT_FLD__SYS_INDEXES__N_FIELDS, &len);
@@ -1875,16 +1870,27 @@ err_len:
 		goto err_len;
 	}
 
-	if (rec_get_deleted_flag(rec, 0)) {
-		return(dict_load_index_del);
+	ut_d(const auto name_offs =)
+	rec_get_nth_field_offs_old(rec, DICT_FLD__SYS_INDEXES__NAME, &len);
+	ut_ad(name_offs == 8 + 8 + DATA_TRX_ID_LEN + DATA_ROLL_PTR_LEN);
+
+	if (len == 0 || len == UNIV_SQL_NULL) {
+		goto err_len;
 	}
 
-	if (mtr) {
-		*index = dict_mem_index_create(NULL, name_buf, type, n_fields);
-	} else {
-		ut_a(*index);
+	if (rec_get_deleted_flag(rec, 0)) {
+		return dict_load_index_del;
+	}
 
-		dict_mem_fill_index_struct(*index, NULL, name_buf,
+	char* name = mem_heap_strdupl(heap, reinterpret_cast<const char*>(rec)
+				      + (8 + 8 + DATA_TRX_ID_LEN
+					 + DATA_ROLL_PTR_LEN),
+				      len);
+
+	if (mtr) {
+		*index = dict_mem_index_create(table, name, type, n_fields);
+	} else {
+		dict_mem_fill_index_struct(*index, nullptr, name,
 					   type, n_fields);
 	}
 
@@ -1916,7 +1922,7 @@ dict_load_indexes(
 	dtuple_t*	tuple;
 	dfield_t*	dfield;
 	const rec_t*	rec;
-	byte*		buf;
+	byte		buf[8];
 	mtr_t		mtr;
 	dberr_t		error = DB_SUCCESS;
 
@@ -1934,7 +1940,6 @@ dict_load_indexes(
 	tuple = dtuple_create(heap, 1);
 	dfield = dtuple_get_nth_field(tuple, 0);
 
-	buf = static_cast<byte*>(mem_heap_alloc(heap, 8));
 	mach_write_to_8(buf, table->id);
 
 	dfield_set_data(dfield, buf, 8);
@@ -1970,7 +1975,8 @@ dict_load_indexes(
 			}
 		}
 
-		err_msg = dict_load_index_low(buf, heap, rec, &mtr, &index);
+		err_msg = dict_load_index_low(buf, heap, rec, &mtr, table,
+					      &index);
 		ut_ad(!index == !!err_msg);
 
 		if (err_msg == dict_load_index_none) {
@@ -1980,10 +1986,6 @@ dict_load_indexes(
 		}
 
 		if (err_msg == dict_load_index_del) {
-			const trx_id_t id = mach_read_from_6(rec + 8 + 8);
-			if (id > table->def_trx_id) {
-				table->def_trx_id = id;
-			}
 			goto next_rec;
 		} else if (err_msg) {
 			ib::error() << err_msg;
@@ -2058,7 +2060,6 @@ corrupted:
 			dictionary cache for such metadata corruption,
 			since we would always be able to set it
 			when loading the dictionary cache */
-			index->table = table;
 			dict_set_corrupted_index_cache_only(index);
 		} else if (!dict_index_is_clust(index)
 			   && NULL == dict_table_get_first_index(table)) {
@@ -2077,7 +2078,6 @@ corrupted:
 			of the database server */
 			dict_mem_index_free(index);
 		} else {
-			index->table = table;
 			dict_load_fields(index, heap);
 
 			/* The data dictionary tables should never contain
